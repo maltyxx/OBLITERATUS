@@ -151,6 +151,25 @@ obliteratus ui --auth user:pass     # add basic auth
 
 The `obliteratus ui` command adds a Rich terminal startup with GPU detection and hardware-appropriate model recommendations. You can also run `python app.py` directly (same thing the Space uses).
 
+### macOS / Apple Silicon setup
+
+OBLITERATUS runs natively on Apple Silicon using the Metal Performance Shaders (MPS) backend. The GPU is used automatically — no CUDA required.
+
+```bash
+# Create and activate a virtual environment
+python3 -m venv .venv
+source .venv/bin/activate
+
+# Install dependencies
+pip install -r requirements.txt -r requirements-apple.txt
+
+# Install OBLITERATUS
+pip install -e .
+
+# Run obliteration (device=auto will select MPS)
+obliteratus obliterate <model> --device auto --dtype <dtype> --method <method>
+```
+
 ### 3. Google Colab (free GPU)
 
 [![Open in Colab](https://colab.research.google.com/assets/colab-badge.svg)](https://colab.research.google.com/github/elder-plinius/OBLITERATUS/blob/main/notebooks/abliterate.ipynb)
