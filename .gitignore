@@ -18,6 +18,8 @@ env/
 wandb/
 outputs/
 results/
+abliterated/
+abliterated_informed/
 .ruff_cache/
 .pytest_cache/
 .mypy_cache/
