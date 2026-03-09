@@ -126,7 +126,14 @@ _REASONING_NAME_PATTERNS_RE = [
     re.compile(r"qwq", re.IGNORECASE),                           # QwQ
     re.compile(r"(?:^|[-_/])o1(?:[-_/]|$)", re.IGNORECASE),     # OpenAI o1
     re.compile(r"(?:^|[-_/])o3(?:[-_/]|$)", re.IGNORECASE),     # OpenAI o3
+    re.compile(r"qwen3[\._-]", re.IGNORECASE),                  # Qwen3.x (thinking mode)
 ]
+
+# Model types (from HF config) that have thinking/reasoning capability,
+# even when the model name doesn't match name patterns above.
+_REASONING_MODEL_TYPES = frozenset({
+    "qwen3", "qwen3_moe", "qwen3_5", "qwen3_5_text",
+})
 
 # Distill patterns (reasoning distillations into dense models)
 _REASONING_DISTILL_PATTERNS = [
@@ -224,11 +231,16 @@ def detect_architecture(
                     is_moe = True
                     break
 
-    # Reasoning detection
-    for pattern in _REASONING_DISTILL_PATTERNS:
-        if pattern.lower() in name_lower:
-            is_reasoning = True
-            break
+    # Reasoning detection — check model_type first (most reliable), then
+    # name patterns, then distill patterns.
+    if model_type in _REASONING_MODEL_TYPES:
+        is_reasoning = True
+
+    if not is_reasoning:
+        for pattern in _REASONING_DISTILL_PATTERNS:
+            if pattern.lower() in name_lower:
+                is_reasoning = True
+                break
 
     if not is_reasoning:
         for pattern_re in _REASONING_NAME_PATTERNS_RE:

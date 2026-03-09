@@ -40,6 +40,7 @@ from obliteratus import device as dev  # noqa: E402 — must import before CUDA 
 # fix for "reserved but unallocated" memory issues.
 dev.configure_cuda_alloc()
 
+from obliteratus.architecture_profiles import _REASONING_MODEL_TYPES  # noqa: E402
 from obliteratus.models.loader import ModelHandle, load_model  # noqa: E402
 from obliteratus.strategies.utils import (  # noqa: E402
     get_attention_module,
@@ -55,6 +56,14 @@ logger = logging.getLogger(__name__)
 # should not increase by more than this factor (1.10 = 10%).  This prevents
 # compounding norm drift across many layers/directions.
 _MAX_NORM_RATIO = 1.10
+
+# Remap composite config model_type to standard type before saving.
+# When a composite config is detected (e.g. Qwen3.5 VL), HF swaps to the text
+# backbone config whose model_type (e.g. "qwen3_5_text") is not recognized by
+# external converters (MLX, llama.cpp).
+_COMPOSITE_MODEL_TYPE_REMAP: dict[str, str] = {
+    "qwen3_5_text": "qwen3_5",
+}
 
 # ── Abliteration method presets ───────────────────────────────────────────
 
@@ -270,6 +279,11 @@ METHODS = {
         "kl_budget": 0.5,
         "use_lora_ablation": False,
         "bayesian_trials": 50,
+        # Activation steering: runtime hooks that subtract refusal direction
+        # from hidden states during generation.  Essential for thinking models
+        # where the reasoning phase can re-derive refusal from residual signal.
+        "activation_steering": True,
+        "steering_strength": 0.2,
     },
     "nuclear": {
         "label": "Nuclear (Maximum Force Combo)",
@@ -1087,12 +1101,49 @@ class AbliterationPipeline:
             jailbreak.append(template.format(prompt=prompt))
         return jailbreak
 
+    def _is_thinking_model(self) -> bool:
+        """Detect if the loaded model supports thinking/reasoning mode.
+
+        Result is cached after the first call (the answer cannot change
+        within a single pipeline run).
+        """
+        if hasattr(self, "_is_thinking_cached"):
+            return self._is_thinking_cached
+
+        result = False
+        if self.handle is not None:
+            arch = self.handle.architecture
+            if arch in _REASONING_MODEL_TYPES:
+                result = True
+            elif hasattr(self.handle.tokenizer, "apply_chat_template"):
+                # Fallback: check if tokenizer supports enable_thinking kwarg
+                try:
+                    test = [{"role": "user", "content": "test"}]
+                    self.handle.tokenizer.apply_chat_template(
+                        test, tokenize=False, add_generation_prompt=True,
+                        enable_thinking=False,
+                    )
+                    result = True
+                except TypeError:
+                    pass
+
+        self._is_thinking_cached = result
+        return result
+
     def _maybe_apply_chat_template(self, prompts: list[str]) -> list[str]:
         """Wrap prompts in the model's chat template if use_chat_template is enabled.
 
         For instruct/chat models, wrapping prompts in the proper template
         (e.g. <|user|>...<|assistant|>) activates the model's refusal circuitry
         more strongly, producing cleaner refusal direction extraction.
+
+        For thinking models (Qwen3, Qwen3.5, etc.), thinking is DISABLED in the
+        template during probe.  The <think> block dilutes the refusal signal by
+        ~1.8x because the model encodes "I'm about to reason" rather than
+        "I'm about to refuse".  Disabling thinking forces the model into direct-
+        response mode where the reflexive refusal direction is much stronger.
+        The weight projection modifies the SAME weights used by both modes, so
+        the abliteration transfers to thinking-enabled inference.
         """
         if not self.use_chat_template:
             return prompts
@@ -1113,15 +1164,24 @@ class AbliterationPipeline:
             return prompts
 
         n = len(prompts)
-        self.log(f"  Wrapping {n} prompts with chat template")
+
+        # Detect thinking model and disable thinking during probe
+        disable_thinking = self._is_thinking_model()
+        if disable_thinking:
+            self.log(f"  Wrapping {n} prompts with chat template (thinking DISABLED for cleaner probe)")
+        else:
+            self.log(f"  Wrapping {n} prompts with chat template")
+
+        # Build template kwargs
+        template_kwargs = {"tokenize": False, "add_generation_prompt": True}
+        if disable_thinking:
+            template_kwargs["enable_thinking"] = False
 
         # Try batch application first (single call, much faster for large sets)
         all_conversations = [[{"role": "user", "content": p}] for p in prompts]
         try:
             wrapped = [
-                tokenizer.apply_chat_template(
-                    conv, tokenize=False, add_generation_prompt=True
-                )
+                tokenizer.apply_chat_template(conv, **template_kwargs)
                 for conv in all_conversations
             ]
             self.log(f"    chat template {n}/{n}")
@@ -1132,9 +1192,7 @@ class AbliterationPipeline:
         wrapped = []
         for i, conv in enumerate(all_conversations):
             try:
-                text = tokenizer.apply_chat_template(
-                    conv, tokenize=False, add_generation_prompt=True
-                )
+                text = tokenizer.apply_chat_template(conv, **template_kwargs)
                 wrapped.append(text)
             except Exception:
                 wrapped.append(prompts[i])  # fallback to raw if individual prompt fails
@@ -6019,6 +6077,13 @@ class AbliterationPipeline:
         # when these conversions are present, so we can't gate on it.
         if hasattr(model, "_weight_conversions"):
             del model._weight_conversions
+
+        # Fix composite model_type for external tool compatibility (MLX, llama.cpp).
+        orig_model_type = getattr(model.config, "model_type", "")
+        remapped_type = _COMPOSITE_MODEL_TYPE_REMAP.get(orig_model_type)
+        if remapped_type:
+            self.log(f"Remapping model_type: {orig_model_type} -> {remapped_type} (for MLX/llama.cpp compatibility)")
+            model.config.model_type = remapped_type
 
         # Use 2 GB shards to reduce peak memory during serialization (default
         # is 5 GB which can cause OOM when GPU tensors are copied to CPU).
